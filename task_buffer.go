@@ -10,6 +10,13 @@ const (
 	taskBufferFull
 )
 
+const (
+	// maxWorkerTaskBatchSize bounds how long one worker can drain the overflow
+	// queue before returning to the handoff channel. Keeping it bounded avoids
+	// turning high backlog throughput into unbounded latency for newer tasks.
+	maxWorkerTaskBatchSize = 64
+)
+
 // taskChunk is a fixed-size node in the linked-list task buffer.
 // Each chunk holds up to taskChunkSize Task values. Using small,
 // fixed-size nodes avoids the doubling overhead of a single slice
@@ -94,6 +101,54 @@ func (b *chunkedTaskBuffer) PopBatch(dst []Task) int {
 	}
 
 	return n
+}
+
+// PopAdaptiveBatch drains a backlog-dependent number of tasks into dst.
+// The batch size is selected while taskMu is held, so workers do not take a
+// separate length snapshot lock before draining. Shallow queues use tiny
+// batches for fairness; deeper queues amortize the shared lock acquisition.
+func (b *chunkedTaskBuffer) PopAdaptiveBatch(dst []Task) int {
+	b.taskMu.Lock()
+	defer b.taskMu.Unlock()
+
+	limit := adaptiveTaskBatchSize(b.chunkLen, len(dst))
+	n := 0
+	for n < limit {
+		t, ok := b.popHead()
+		if !ok {
+			break
+		}
+		dst[n] = t
+		n++
+	}
+
+	return n
+}
+
+// adaptiveTaskBatchSize balances queue fairness and lock amortization.
+// maxSize is normally the worker's stack batch capacity; zero means there is
+// no destination space and therefore no work should be removed.
+func adaptiveTaskBatchSize(backlog int64, maxSize int) int {
+	if backlog <= 0 || maxSize <= 0 {
+		return 0
+	}
+
+	var size int
+	switch {
+	case backlog <= 8:
+		size = 1
+	case backlog <= 64:
+		size = 8
+	case backlog <= 512:
+		size = 32
+	default:
+		size = maxWorkerTaskBatchSize
+	}
+
+	if size > maxSize {
+		return maxSize
+	}
+	return size
 }
 
 // pushTail appends a task to the tail of the chunked buffer.

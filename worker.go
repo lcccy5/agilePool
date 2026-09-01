@@ -34,6 +34,9 @@ func (w *worker) run(task Task) {
 	// Submits could then concurrently spawn two goroutines on the same
 	// *worker via Pop and workerPool.Get respectively, causing a data race
 	// on w.lastActiveAt and phantom duplicates in idleWorks.
+	// Keep one reusable stack batch per worker. Processed entries are cleared
+	// below so a parked worker does not retain completed task payloads.
+	var batch [maxWorkerTaskBatchSize]Task
 
 loop:
 	for {
@@ -58,16 +61,14 @@ loop:
 			w.runTask(task)
 
 		default:
-			// Try the chunked buffer before the second channel check.
-			// Grab a batch of up to 8 tasks per lock acquisition to
-			// amortise the mutex overhead across multiple tasks and
-			// reduce contention with the submission path.
-			const batchSize = 8
-			var batch [batchSize]Task
-			n := w.pool.taskBuf.PopBatch(batch[:])
+			// Try the chunked buffer before the second channel check. The buffer
+			// chooses a larger batch only when backlog is deep enough to justify
+			// fewer lock acquisitions; the fixed upper bound preserves fairness.
+			n := w.pool.taskBuf.PopAdaptiveBatch(batch[:])
 			for i := 0; i < n; i++ {
 				w.lastActiveAt = time.Now()
 				w.runTask(batch[i])
+				batch[i] = nil // Release task payloads before this worker parks.
 			}
 			if n > 0 {
 				continue
